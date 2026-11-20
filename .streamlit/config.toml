@@ -1,0 +1,10 @@
+# Streamlit 主题配置：与「宠物服务上门平台」保持同一套青绿色视觉
+[theme]
+primaryColor = "#2f9e7e"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f5f7f6"
+textColor = "#1f2d2a"
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false
