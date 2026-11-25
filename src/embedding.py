@@ -1,21 +1,17 @@
-"""文本向量化（Embedding）。
+"""文本向量化。
 
-为什么不直接用 Chroma 自带的默认模型：
-它会在首次运行时从 HuggingFace 下载 all-MiniLM-L6-v2（约 80MB），
-国内网络经常失败，新手第一步就卡住。所以这里做了两种实现：
+支持两类实现：
+1. local：字符 n-gram + 哈希签名，仅依赖标准库，可离线运行。
+2. dashscope：调用 text-embedding-v3，需要 API Key。
 
-1. local（默认）：字符 n-gram + 哈希签名，纯标准库实现，零下载、离线可用。
-   对中文短文本检索效果足够（本质是特征哈希版 TF 向量 + 余弦相似度）。
-2. dashscope：调用阿里云 text-embedding-v3，语义泛化更好，需要 API Key。
-
-切换 embedding 后必须重建知识库（维度不同），build_kb 脚本会自动检测并提示。
+不同实现的向量维度可能不同；切换配置后需要重建知识库。
 """
 
 import hashlib
 import json
 import math
 import re
-import urllib.error
+import threading
 import urllib.request
 from typing import List
 
@@ -101,7 +97,7 @@ class DashScopeEmbedder(BaseEmbedder):
         self.dim = dim
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        # 接口单次最多 10 条，这里分批
+        # 接口单次最多处理 10 条。
         results: List[List[float]] = []
         for i in range(0, len(texts), 10):
             results.extend(self._call(texts[i:i + 10]))
@@ -125,14 +121,34 @@ class DashScopeEmbedder(BaseEmbedder):
         return [item["embedding"] for item in items]
 
 
+_embedder: BaseEmbedder | None = None
+_embedder_lock = threading.Lock()
+
+
 def get_embedder() -> BaseEmbedder:
     """按配置返回向量化实现；云端失败自动降级到本地。"""
-    if settings.embedding_provider == "dashscope" and settings.dashscope_api_key:
-        try:
-            embedder = DashScopeEmbedder(settings.dashscope_api_key, dim=1024)
-            # 探活：真发一条短文本，失败会抛异常
-            embedder.embed_documents(["连接测试"])
-            return embedder
-        except (urllib.error.URLError, KeyError, TimeoutError, OSError) as exc:
-            print(f"[embedding] 云端向量化不可用（{exc}），已降级为本地实现")
-    return LocalHashEmbedder(dim=settings.embedding_dim)
+    global _embedder
+    if _embedder is not None:
+        return _embedder
+
+    with _embedder_lock:
+        if _embedder is not None:
+            return _embedder
+        if settings.embedding_provider == "dashscope" and settings.dashscope_api_key:
+            try:
+                candidate = DashScopeEmbedder(settings.dashscope_api_key, dim=1024)
+                # 探活只做一次，避免每次检索/构建都产生额外网络请求。
+                candidate.embed_documents(["连接测试"])
+                _embedder = candidate
+                return _embedder
+            except Exception as exc:
+                print(f"[embedding] 云端向量化不可用（{exc}），已降级为本地实现")
+        _embedder = LocalHashEmbedder(dim=settings.embedding_dim)
+        return _embedder
+
+
+def reset_embedder() -> None:
+    """清空单例，主要供测试或运行时重新加载配置使用。"""
+    global _embedder
+    with _embedder_lock:
+        _embedder = None

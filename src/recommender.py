@@ -1,14 +1,7 @@
-"""服务智能推荐：把「咨询」变成「可下单的服务」。
+"""服务推荐。
 
-两路信号融合打分：
-1. 语义相似度：问题向量 vs 服务描述向量（能处理「毛孩子没人管」这类口语表达）
-2. 规则命中：关键词 / 品种 / 场景标签（精准，且能解释推荐理由）
-
-为什么不用纯向量：纯向量容易把「洗澡」推成「喂养」，业务上不可接受；
-纯规则又太死板。融合后再用规则做兜底优先级，既准又可解释。
-
-推荐结果直接带宠物平台的预约链接（/user/service/{id}），
-与「宠物服务上门平台」的 t_service.id 一一对应，打通咨询 → 下单。
+推荐分数融合语义相似度与关键词规则，并结合宠物类型和上下架状态过滤候选。
+结果中的 service id 与上门服务平台 t_service.id 对应。
 """
 
 import json
@@ -53,6 +46,7 @@ class ServiceRecommender:
         question: str,
         profile: Optional[Dict] = None,
         top_n: Optional[int] = None,
+        require_match: bool = False,
     ) -> List[Dict]:
         profile = profile or {}
         top_n = top_n or settings.recommend_top_n
@@ -73,6 +67,8 @@ class ServiceRecommender:
             hits = [kw for kw in service.get("keywords", []) if kw and kw in question]
             issue_hits = [i for i in service.get("suitable_issues", []) if i and i in question]
             rule_score = min(1.0, (len(hits) * 0.5 + len(issue_hits) * 0.3))
+            if require_match and not (hits or issue_hits):
+                continue
 
             # ---- 语义分 ----
             semantic_raw = max(0.0, self._cosine(query_vec, vec))
@@ -119,7 +115,7 @@ class ServiceRecommender:
 
     @staticmethod
     def _build_reason(service: Dict, hits: List[str], pet_type: Optional[str]) -> str:
-        """生成人话推荐理由，面试演示时比一串分数有说服力。"""
+        """生成可展示的推荐理由。"""
         reasons: List[str] = []
         if hits:
             reasons.append("匹配到「" + "、".join(dict.fromkeys(hits)) + "」")

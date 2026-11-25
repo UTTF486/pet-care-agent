@@ -1,11 +1,7 @@
 """大模型客户端。
 
-统一到 OpenAI 兼容协议：通义千问（DashScope）和豆包（火山方舟）都提供
-`/v1/chat/completions` 兼容端点，所以一个 ChatOpenAI 客户端就能切换两家，
-不必为每家装一套 SDK —— 这也是面试时可以讲的技术选型点。
-
-没有配置 Key 时进入「离线兜底模式」：available=False，
-上层用模板合成答案，保证项目在当前电脑上一定能跑通演示。
+DeepSeek、通义千问和豆包均通过 OpenAI 兼容接口接入。未配置密钥时，
+客户端标记为不可用，由上层切换到抽取式回答。
 """
 
 import logging
@@ -94,3 +90,9 @@ def get_llm() -> LLMClient:
     if _llm_client is None:
         _llm_client = LLMClient()
     return _llm_client
+
+
+def reset_llm() -> None:
+    """清空单例，让温度等运行期配置在下一次调用时生效。"""
+    global _llm_client
+    _llm_client = None

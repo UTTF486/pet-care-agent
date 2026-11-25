@@ -1,7 +1,6 @@
-"""集中管理配置。
+"""应用配置。
 
-设计原则：所有可调参数都能用环境变量覆盖，且**默认值保证项目开箱即跑**。
-即使没有大模型 API Key，项目也能以「离线兜底模式」完整演示流程。
+可调参数统一从环境变量读取；未配置大模型密钥时使用离线兜底实现。
 """
 
 import os
@@ -13,7 +12,7 @@ from dotenv import load_dotenv
 # 项目根目录（本文件所在目录）
 BASE_DIR = Path(__file__).resolve().parent
 
-# 加载 .env（不存在也不报错，方便新手直接跑）
+# 加载本地 .env；文件不存在时忽略。
 load_dotenv(BASE_DIR / ".env")
 
 DATA_DIR = BASE_DIR / "data"
@@ -26,6 +25,22 @@ COLLECTION_NAME = "pet_knowledge"
 
 def _env_bool(key: str, default: bool = False) -> bool:
     return os.getenv(key, str(default)).lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(key: str, default: int, minimum: int = 1) -> int:
+    """读取整数配置，非法值回退到默认值，避免应用在 import 阶段直接崩溃。"""
+    try:
+        return max(minimum, int(os.getenv(key, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(key: str, default: float, minimum: float = 0.0) -> float:
+    """读取浮点配置，非法值回退到默认值。"""
+    try:
+        return max(minimum, float(os.getenv(key, str(default))))
+    except (TypeError, ValueError):
+        return default
 
 
 @dataclass
@@ -51,33 +66,33 @@ class Settings:
     compat_api_key: str = os.getenv("LLM_API_KEY", "")
     compat_base_url: str = os.getenv("LLM_BASE_URL", "")
     compat_model: str = os.getenv("LLM_MODEL", "")
-    temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.3"))
-    max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "800"))
+    temperature: float = _env_float("LLM_TEMPERATURE", 0.3)
+    max_tokens: int = _env_int("LLM_MAX_TOKENS", 800)
 
     # ---------------- 向量化 ----------------
     # local: 内置字符 n-gram 哈希向量（零依赖、离线可用）
     # dashscope: 调用 text-embedding-v3（需要 Key，效果更好）
     embedding_provider: str = os.getenv("EMBEDDING_PROVIDER", "local").lower()
-    embedding_dim: int = int(os.getenv("EMBEDDING_DIM", "768"))
+    embedding_dim: int = _env_int("EMBEDDING_DIM", 768)
 
     # ---------------- 检索 ----------------
-    top_k: int = int(os.getenv("RETRIEVAL_TOP_K", "4"))
-    chunk_size: int = int(os.getenv("CHUNK_SIZE", "380"))
-    chunk_overlap: int = int(os.getenv("CHUNK_OVERLAP", "60"))
+    top_k: int = _env_int("RETRIEVAL_TOP_K", 4)
+    chunk_size: int = _env_int("CHUNK_SIZE", 380)
+    chunk_overlap: int = _env_int("CHUNK_OVERLAP", 60)
     # 低于该值视为「知识库没覆盖」，触发兜底话术，减少瞎编。
     # 注意这是「0.65*词项覆盖率 + 0.35*余弦」的混合分，不是纯余弦，
     # 所以标尺和常见向量库的 0.7/0.8 完全不同：相关片段通常在 0.15-0.45，
     # 无关片段在 0.03-0.12。调高更保守（更容易说不知道），调低更激进。
-    min_similarity: float = float(os.getenv("MIN_SIMILARITY", "0.12"))
+    min_similarity: float = _env_float("MIN_SIMILARITY", 0.12)
 
     # ---------------- 业务联动 ----------------
     # 宠物服务上门平台的前端地址，推荐结果里给出可点击的预约链接
     platform_base_url: str = os.getenv("PLATFORM_BASE_URL", "http://localhost:5173")
-    recommend_top_n: int = int(os.getenv("RECOMMEND_TOP_N", "2"))
+    recommend_top_n: int = _env_int("RECOMMEND_TOP_N", 2)
 
     # ---------------- 其他 ----------------
     verbose: bool = _env_bool("VERBOSE", False)
-    max_history_turns: int = int(os.getenv("MAX_HISTORY_TURNS", "6"))
+    max_history_turns: int = _env_int("MAX_HISTORY_TURNS", 6)
 
     # 派生字段：实际生效的提供方
     effective_provider: str = field(init=False, default="")
@@ -87,8 +102,16 @@ class Settings:
 
     def _resolve_provider(self) -> str:
         """把 auto 解析成具体实现。"""
+        if self.llm_provider == "mock":
+            return "mock"
         if self.llm_provider != "auto":
-            return self.llm_provider
+            has_credentials = {
+                "deepseek": bool(self.deepseek_api_key),
+                "dashscope": bool(self.dashscope_api_key),
+                "ark": bool(self.ark_api_key),
+                "compat": bool(self.compat_api_key and self.compat_base_url),
+            }.get(self.llm_provider, False)
+            return self.llm_provider if has_credentials else "mock"
         if self.deepseek_api_key:
             return "deepseek"
         if self.dashscope_api_key:

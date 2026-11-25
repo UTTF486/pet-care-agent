@@ -1,20 +1,14 @@
-"""知识库构建与检索（Chroma 持久化向量库）。
+"""知识库构建与检索。
 
-流程：
-    data/knowledge/*.md
-        → 按二级标题切「章节」
-        → 章节内再按语义边界切「片段」（chunk）
-        → 向量化写入 Chroma（持久化到 chroma_db/）
-        → 查询时问题向量化 → 余弦相似度取 top_k
-
-为什么按标题切而不是直接切固定长度：
-宠物养护知识天然按「症状 / 原因 / 处理」分节，按标题切能保证
-一个 chunk 内语义完整；再叠加 RecursiveCharacterTextSplitter 兜底长章节。
+Markdown 文档先按二级标题分节，再按语义边界切片并写入 Chroma。
+查询阶段先做向量召回，再结合词项覆盖率进行混合重排。
 """
 
+import hashlib
 import json
 import math
 import re
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -25,6 +19,9 @@ from config import CHROMA_DIR, COLLECTION_NAME, KNOWLEDGE_DIR, settings
 from src.embedding import get_embedder
 
 META_FILE = CHROMA_DIR / "_meta.json"
+_client = None
+_collection = None
+_knowledge_lock = threading.Lock()
 
 # 先按中文语义边界切，再退化为按字符切
 SPLITTER = RecursiveCharacterTextSplitter(
@@ -37,29 +34,58 @@ SPLITTER = RecursiveCharacterTextSplitter(
 # ------------------------- 底层连接 -------------------------
 
 def get_client() -> chromadb.PersistentClient:
-    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-    return chromadb.PersistentClient(path=str(CHROMA_DIR))
+    global _client
+    if _client is None:
+        with _knowledge_lock:
+            if _client is None:
+                CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+                _client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+    return _client
 
 
 def get_collection(rebuild: bool = False):
+    global _collection
+    if _collection is not None and not rebuild:
+        return _collection
+
     client = get_client()
-    if rebuild:
-        try:
-            client.delete_collection(COLLECTION_NAME)
-        except Exception:
-            pass  # 不存在时忽略
-    # cosine 距离：1 - 余弦相似度，数值越小越相似
-    return client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        metadata={"hnsw:space": "cosine"},
-    )
+    with _knowledge_lock:
+        if rebuild:
+            try:
+                client.delete_collection(COLLECTION_NAME)
+            except Exception:
+                pass  # 不存在时忽略
+            _collection = None
+        if _collection is None:
+            # cosine 距离：1 - 余弦相似度，数值越小越相似
+            _collection = client.get_or_create_collection(
+                name=COLLECTION_NAME,
+                metadata={"hnsw:space": "cosine"},
+            )
+    return _collection
+
+
+def corpus_fingerprint() -> str:
+    """基于文档名和内容生成稳定指纹，用于识别同片段数下的内容变更。"""
+    digest = hashlib.sha256()
+    for path in sorted(KNOWLEDGE_DIR.glob("*.md")):
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _stable_id(*parts: str) -> str:
+    payload = "\0".join(parts).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:20]
 
 
 def _read_meta() -> Dict:
     if META_FILE.exists():
         try:
             return json.loads(META_FILE.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, OSError):
             return {}
     return {}
 
@@ -107,7 +133,7 @@ def load_chunks() -> List[Dict]:
                     continue
                 chunks.append(
                     {
-                        "id": f"{path.stem}#{abs(hash(section['title'])) % 10000}-{idx}",
+                        "id": _stable_id(path.stem, section["title"], piece, str(idx)),
                         "text": piece,
                         # 把标题拼进正文，提升召回（用户问「疫苗」时标题也能命中）
                         "embed_text": f"{section['title']}\n{piece}",
@@ -143,7 +169,17 @@ def build_knowledge_base(rebuild: bool = True, verbose: bool = True) -> Dict:
                 embeddings=embeddings[i:i + batch],
             )
 
-    _write_meta({"provider": embedder.provider, "dim": embedder.dim, "chunks": len(chunks)})
+    _write_meta(
+        {
+            "provider": embedder.provider,
+            "dim": embedder.dim,
+            "chunks": len(chunks),
+            "fingerprint": corpus_fingerprint(),
+            "chunk_size": settings.chunk_size,
+            "chunk_overlap": settings.chunk_overlap,
+        }
+    )
+    _TERM_INDEX.update(count=-1, idf={})
     stats = {
         "chunks": len(chunks),
         "sources": sorted({c["source"] for c in chunks}),
@@ -167,6 +203,9 @@ def ensure_knowledge_base(verbose: bool = False) -> Dict:
         count == 0
         or meta.get("provider") != embedder.provider
         or meta.get("dim") != embedder.dim
+        or meta.get("fingerprint") != corpus_fingerprint()
+        or meta.get("chunk_size") != settings.chunk_size
+        or meta.get("chunk_overlap") != settings.chunk_overlap
     )
     if need_rebuild:
         if verbose:
@@ -181,13 +220,12 @@ def ensure_knowledge_base(verbose: bool = False) -> Dict:
 def _terms(text: str) -> set:
     """抽取用于匹配的词项。
 
-    中文没有空格，这里用「去标点 + 去停用字 + 字符 2-gram」的组合：
+    中文没有空格，使用「去标点 + 去停用字 + 字符 2-gram」：
     - 去标点：问号、逗号不应该参与匹配
     - 去停用字：的/了/是/吗 这类字组合出来的 bigram 没有区分度
     - 2-gram：在中文上等价于粗分词，不需要额外依赖 jieba
 
-    这一步是检索质量的关键。最初直接用原始字符 2-gram，
-    结果「克猫粮」和「克干粮」匹配不上，所有文档分数都平在 0.067。
+    该组合可避免标点和无效二元词干扰，同时不引入额外分词依赖。
     """
     compact = re.sub(r"[^\w\u4e00-\u9fa5]+", "", text or "")
     compact = "".join(ch for ch in compact if ch not in STOP_CHARS)
@@ -234,11 +272,8 @@ def _get_idf(collection) -> Dict[str, float]:
 def search(query: str, top_k: Optional[int] = None) -> List[Dict]:
     """检索：先向量召回，再混合重排。
 
-    为什么要重排：
-    纯哈希向量的余弦值受文档长度影响很大 —— 一个 200 字的片段里
-    只有 2-3 个词和问题重合时，余弦只有 0.08 左右，直接卡阈值会把
-    正确答案全部误杀。所以先用向量广撒网（召回 4 倍候选），
-    再用「IDF 加权词项覆盖率」重排：
+    余弦相似度容易受片段长度影响，因此先扩大向量召回范围，
+    再用 IDF 加权词项覆盖率进行重排：
 
         score = 0.65 * 覆盖率 + 0.35 * 余弦
 
@@ -246,10 +281,10 @@ def search(query: str, top_k: Optional[int] = None) -> List[Dict]:
     它的含义是「这个问题有多少信息量被这个片段覆盖了」，
     取值 0-1、绝对值可比，阈值才有意义。
 
-    这是「召回 + 重排（recall-then-rerank）」的轻量版；
-    换成专业 embedding 或接 rerank 模型时，只需调整两个权重。
+    该流程对应轻量级 recall-then-rerank；更换 embedding 或 rerank 模型时，
+    可相应调整混合权重。
     """
-    top_k = top_k or settings.top_k
+    top_k = max(1, min(int(top_k or settings.top_k), 20))
     collection = get_collection()
     if collection.count() == 0:
         return []
@@ -302,7 +337,9 @@ def add_uploaded_text(filename: str, text: str) -> int:
     """把用户上传的 txt/md 内容加入知识库，返回新增片段数（Streamlit 用）。"""
     embedder = get_embedder()
     collection = get_collection()
-    sections = _split_sections(text, fallback_title=Path(filename).stem)
+    safe_filename = Path(filename).name
+    source = f"upload:{safe_filename}"
+    sections = _split_sections(text, fallback_title=Path(safe_filename).stem)
 
     rows: List[Dict] = []
     for section in sections:
@@ -312,26 +349,29 @@ def add_uploaded_text(filename: str, text: str) -> int:
                 continue
             rows.append(
                 {
-                    "id": f"upload::{filename}#{abs(hash(section['title'])) % 10000}-{idx}",
+                    "id": _stable_id(source, section["title"], piece, str(idx)),
                     "text": piece,
                     "embed_text": f"{section['title']}\n{piece}",
                     "title": section["title"],
                 }
             )
 
-    if not rows:
-        return 0
+    embeddings = embedder.embed_documents([r["embed_text"] for r in rows]) if rows else []
 
-    collection.add(
-        ids=[r["id"] for r in rows],
-        documents=[r["text"] for r in rows],
-        metadatas=[{"source": f"upload:{filename}", "title": r["title"], "category": "用户上传"} for r in rows],
-        embeddings=embedder.embed_documents([r["embed_text"] for r in rows]),
-    )
+    # 同名文件再次上传时替换旧内容，避免新旧片段同时被检索。
+    collection.delete(where={"source": source})
+    if rows:
+        collection.upsert(
+            ids=[r["id"] for r in rows],
+            documents=[r["text"] for r in rows],
+            metadatas=[{"source": source, "title": r["title"], "category": "用户上传"} for r in rows],
+            embeddings=embeddings,
+        )
 
     meta = _read_meta()
     meta["chunks"] = collection.count()
     _write_meta(meta)
+    _TERM_INDEX.update(count=-1, idf={})
     return len(rows)
 
 

@@ -1,6 +1,6 @@
 """LangGraph 多轮对话工作流。
 
-图结构（面试时可以照着这张图讲）：
+工作流：
 
                        ┌──────────┐
         START ────────▶│ analyze  │  意图识别 + 槽位抽取 + 追问判断
@@ -61,6 +61,7 @@ class AgentState(TypedDict, total=False):
     history: List[Dict[str, str]]  # 多轮对话历史（跨轮持久化）
     profile: Dict[str, str]        # 用户画像：pet_type / age / 症状关键词
     intent: str                    # knowledge / service / chitchat / ask_more
+    pending_intent: str            # 追问前保留的业务意图，下一轮补齐槽位后恢复
     need_slots: List[str]          # 缺失的必要信息
     docs: List[Dict]               # 检索到的知识片段
     answer: str                    # 最终回答
@@ -140,10 +141,40 @@ def _extract_profile(question: str, base: Optional[Dict[str, str]]) -> Dict[str,
     issues = [w for w in ISSUE_WORDS if w in question]
     if issues:
         # 最多保留最近提到的 3 个症状，避免画像无限膨胀
-        merged = list(dict.fromkeys((profile.get("issues", "") + "," + ",".join(issues)).strip(",").split(",")))
+        previous = [i for i in profile.get("issues", "").split(",") if i]
+        merged = list(dict.fromkeys(issues + previous))
         profile["issues"] = ",".join([i for i in merged if i][:3])
 
     return profile
+
+
+def _contextual_query(
+    question: str,
+    profile: Dict[str, str],
+    history: Optional[List[Dict[str, str]]] = None,
+) -> str:
+    """把当前问题和已确认画像拼成检索语句，修复“只回答一个猫字”时的召回失败。"""
+    parts = [question.strip()]
+    has_new_intent = any(
+        word in question
+        for word in KNOWLEDGE_WORDS + SERVICE_WORDS + CHITCHAT_WORDS
+    )
+    if history and len(re.sub(r"\s", "", question)) <= 8 and not has_new_intent:
+        previous = next(
+            (
+                (item.get("content") or "").strip()
+                for item in reversed(history)
+                if item.get("role") == "user" and (item.get("content") or "").strip() != question
+            ),
+            "",
+        )
+        if previous:
+            parts.append(previous)
+    for key in ("pet_type", "breed", "age", "issues"):
+        value = (profile.get(key) or "").strip()
+        if value and value not in question:
+            parts.append(value.replace(",", " "))
+    return " ".join(part for part in parts if part)
 
 
 class PetConsultAgent:
@@ -197,6 +228,7 @@ class PetConsultAgent:
         question = (state.get("question") or "").strip()
         history = state.get("history") or []
         profile = _extract_profile(question, state.get("profile"))
+        pending_intent = state.get("pending_intent") or ""
 
         trace: List[str] = []
 
@@ -211,6 +243,11 @@ class PetConsultAgent:
             # 兜底当作知识问答（比乱推服务更安全）
             intent, hit = "knowledge", "默认"
 
+        # 上一轮因缺槽位而追问时，短回答（如“猫”）应延续原业务意图。
+        if hit == "默认" and pending_intent in ("knowledge", "service"):
+            intent = pending_intent
+            trace.append(f"延续待补全意图：{pending_intent}")
+
         trace.append(f"意图识别：{intent}（命中关键词「{hit}」）")
 
         # 2. 槽位检查：信息不足就先追问，不要硬答
@@ -220,7 +257,9 @@ class PetConsultAgent:
         if intent in ("knowledge", "service"):
             if not profile.get("pet_type"):
                 need_slots.append("pet_type")
-            elif intent == "knowledge" and len(re.sub(r"\s", "", question)) <= 6:
+            elif (intent == "knowledge"
+                  and not profile.get("issues")
+                  and len(re.sub(r"\s", "", question)) <= 6):
                 need_slots.append("symptom")
 
         if need_slots:
@@ -233,6 +272,7 @@ class PetConsultAgent:
             "history": history,
             "profile": profile,
             "intent": "ask_more" if need_slots else intent,
+            "pending_intent": intent if need_slots else "",
             "need_slots": need_slots,
             # 每轮重置上一轮的中间结果，避免旧答案串到新问题
             "docs": [],
@@ -264,7 +304,9 @@ class PetConsultAgent:
 
     def _retrieve(self, state: AgentState) -> Dict:
         question = state.get("question", "")
-        docs = search(question, top_k=settings.top_k)
+        profile = state.get("profile") or {}
+        query = _contextual_query(question, profile, state.get("history") or [])
+        docs = search(query, top_k=settings.top_k)
         strong = [d for d in docs if d["score"] >= settings.min_similarity]
         best = docs[0]["score"] if docs else 0.0
         detail = ""
@@ -273,6 +315,7 @@ class PetConsultAgent:
             detail = (f"（top1 覆盖率 {top.get('coverage', 0):.2f} / "
                       f"余弦 {top.get('cosine', 0):.2f}）")
         trace = (state.get("trace") or []) + [
+            f"检索问题：{query}",
             f"混合检索：召回 {len(docs)} 条，{len(strong)} 条达阈值 {settings.min_similarity}"
             f"，最高匹配度 {best:.2f}{detail}"
         ]
@@ -313,10 +356,16 @@ class PetConsultAgent:
     def _recommend(self, state: AgentState) -> Dict:
         question = state.get("question", "")
         profile = state.get("profile") or {}
-        recs = self.recommender.recommend(question, profile)
+        query = _contextual_query(question, profile, state.get("history") or [])
         answer = state.get("answer", "")
+        # 健康问答的附加推荐必须命中明确规则，避免纯语义分把“遛狗”推给腹泻宠物。
+        recs = self.recommender.recommend(
+            query,
+            profile,
+            require_match=state.get("intent") != "service",
+        )
 
-        # 服务意图直接进入推荐节点，没有经过 generate，这里补一段引导语
+        # 服务意图不经过 generate，在推荐节点补齐引导文案。
         if not answer:
             if recs:
                 names = "、".join(f"{r['name']}（¥{r['price']}，约 {r['duration']} 分钟）" for r in recs)
@@ -358,6 +407,11 @@ class PetConsultAgent:
 
     def chat(self, question: str, thread_id: str = "default") -> Dict:
         """执行一轮对话，返回结构化结果供界面渲染。"""
+        question = (question or "").strip()
+        if not question:
+            raise ValueError("问题不能为空")
+        if len(question) > 2000:
+            raise ValueError("问题过长，请精简到 2000 字以内")
         state = self.graph.invoke(
             {"question": question},
             config={"configurable": {"thread_id": thread_id}},
@@ -387,3 +441,9 @@ def get_agent() -> PetConsultAgent:
     if _agent is None:
         _agent = PetConsultAgent()
     return _agent
+
+
+def reset_agent() -> None:
+    """清空 Agent 单例，配合 Streamlit 的参数重建与测试使用。"""
+    global _agent
+    _agent = None

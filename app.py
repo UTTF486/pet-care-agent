@@ -1,22 +1,20 @@
-"""Streamlit 前端。
+"""Streamlit 对话界面。
 
-界面分三块：
-- 左侧边栏：运行状态、参数调试、知识库管理
-- 主区域：多轮对话
-- 每条回答下方：推荐服务 / 参考资料 / 工作流轨迹（可折叠，演示时很有说服力）
-
-启动：streamlit run app.py
+侧边栏提供运行状态、参数调节和知识库管理；主区域负责多轮对话，
+消息下方展示服务推荐、参考引用和工作流轨迹。
 """
 
+import logging
 from uuid import uuid4
 
 import streamlit as st
 
-import src.graph as graph_module
-import src.llm as llm_module
 from config import settings
-from src.graph import get_agent
+from src.graph import get_agent, reset_agent
 from src.knowledge import add_uploaded_text, build_knowledge_base, stats
+from src.llm import reset_llm
+
+logger = logging.getLogger(__name__)
 
 st.set_page_config(page_title="宠物养护智能咨询 Agent", page_icon="🐾", layout="wide")
 
@@ -71,8 +69,8 @@ def render_sidebar() -> None:
                              help="修改后需点下面的按钮重建模型客户端")
         if st.button("应用温度并重建客户端", use_container_width=True):
             settings.temperature = new_temp
-            llm_module._llm_client = None   # 清空单例
-            graph_module._agent = None
+            reset_llm()
+            reset_agent()
             load_agent.clear()
             st.success("已重建，下一轮对话生效")
 
@@ -86,6 +84,7 @@ def render_sidebar() -> None:
 
         if st.button("重建知识库（全量）", use_container_width=True):
             build_knowledge_base(rebuild=True)
+            reset_agent()
             load_agent.clear()
             st.success("已重建")
 
@@ -174,8 +173,9 @@ def main() -> None:
         with st.spinner("正在检索知识库并分析…"):
             try:
                 result = agent.chat(question, thread_id=st.session_state.thread_id)
-            except Exception as exc:  # 兜底，避免一次异常把整个页面刷白
-                st.error(f"处理失败：{exc}")
+            except Exception:  # 兜底，避免一次异常把整个页面刷白
+                logger.exception("Agent 请求处理失败")
+                st.error("处理失败，请稍后重试；详细错误已记录到服务端日志。")
                 return
         msg = {"role": "assistant", **result}
         render_assistant(msg)
